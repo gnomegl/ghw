@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# GHW - Gray Hat Warfare API Client
+# Version: 1.0.0
+
+# @describe Gray Hat Warfare API client for searching exposed cloud storage
+# @env GRAYHAT_API_KEY! Gray Hat Warfare API key
+# @flag -j --json Output raw JSON instead of formatted results
+# @flag -q --quiet Suppress colored output and progress
+
+# Check dependencies
+check_dependencies() {
+    local missing=()
+    
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        printf "${red}Error:${reset} Missing required dependencies: %s\n" "${missing[*]}" >&2
+        printf "Please install the missing dependencies and try again.\n" >&2
+        exit 1
+    fi
+}
+
+# Setup colors
+setup_colors() {
+    if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+        bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red=""
+    else
+        bold=$(tput bold 2>/dev/null || echo "")
+        reset=$(tput sgr0 2>/dev/null || echo "")
+        blue=$(tput setaf 4 2>/dev/null || echo "")
+        green=$(tput setaf 2 2>/dev/null || echo "")
+        yellow=$(tput setaf 3 2>/dev/null || echo "")
+        cyan=$(tput setaf 6 2>/dev/null || echo "")
+        magenta=$(tput setaf 5 2>/dev/null || echo "")
+        red=$(tput setaf 1 2>/dev/null || echo "")
+    fi
+}
+setup_colors
+check_dependencies
+
+# URL encoding function
+url_encode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * ) printf -v o '%%%02x' "'$c" ;;
+        esac
+        encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+# API request helper
+make_request() {
+    local url="$1"
+    local params="$2"
+
+    if [ -z "$GRAYHAT_API_KEY" ]; then
+        printf "${red}Error:${reset} GRAYHAT_API_KEY environment variable is required\n" >&2
+        exit 1
+    fi
+
+    local full_url="${url}?${params}"
+    local response
+
+    # Show progress unless quiet
+    if [ "$argc_quiet" != 1 ]; then
+        response=$(curl -s --show-error \
+            --header "Authorization: Bearer $GRAYHAT_API_KEY" \
+            "$full_url" 2>&1)
+    else
+        response=$(curl -s \
+            --header "Authorization: Bearer $GRAYHAT_API_KEY" \
+            "$full_url" 2>/dev/null)
+    fi
+
+    if [ $? -ne 0 ]; then
+        printf "${red}Error:${reset} Failed to make API request\n" >&2
+        exit 1
+    fi
+
+    # Check for API errors
+    if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        error_msg=$(echo "$response" | jq -r '.error // "Unknown error"')
+        printf "${red}Error:${reset} %s\n" "$error_msg" >&2
+        exit 1
+    fi
+
+    echo "$response"
+}
+
+# Format file size for human readability
+format_size() {
+    local size="$1"
+    if [ "$size" -eq 0 ]; then
+        echo "0 B"
+    elif [ "$size" -lt 1024 ]; then
+        echo "${size} B"
+    elif [ "$size" -lt 1048576 ]; then
+        echo "$(( size / 1024 )) KB"
+    elif [ "$size" -lt 1073741824 ]; then
+        echo "$(( size / 1048576 )) MB"
+    else
+        echo "$(( size / 1073741824 )) GB"
+    fi
+}
+
+# Format timestamp
+format_date() {
+    local timestamp="$1"
+    if command -v date >/dev/null 2>&1; then
+        date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$timestamp"
+    else
+        echo "$timestamp"
+    fi
+}
+
+# Process files search response
+process_files_response() {
+    local response
+    response=$(cat)
+
+    if [ "$argc_json" = 1 ]; then
+        echo "$response" | jq
+        return
+    fi
+
+    local total_results=$(echo "$response" | jq -r '.meta.results // 0')
+    local keywords=$(echo "$response" | jq -r '.query.keywords // ""')
+
+    printf "${bold}Search Results${reset}\n"
+    printf "${cyan}Keywords:${reset} %s\n" "$keywords"
+    printf "${cyan}Total Results:${reset} %s\n" "$total_results"
+    printf "\n"
+
+    # Check if there are files
+    if ! echo "$response" | jq -e '.files | length > 0' >/dev/null 2>&1; then
+        printf "${yellow}No files found${reset}\n"
+        return
+    fi
+
+    # Process each file
+    echo "$response" | jq -c '.files[]' | while read -r file; do
+        local filename=$(echo "$file" | jq -r '.filename')
+        local bucket=$(echo "$file" | jq -r '.bucket')
+        local size=$(echo "$file" | jq -r '.size')
+        local lastmod=$(echo "$file" | jq -r '.lastModified')
+        local url=$(echo "$file" | jq -r '.url')
+
+        printf "${green}%s${reset}\n" "$filename"
+        printf "  ${cyan}Bucket:${reset} %s\n" "$bucket"
+        printf "  ${cyan}Size:${reset} %s\n" "$(format_size "$size")"
+        printf "  ${cyan}Modified:${reset} %s\n" "$(format_date "$lastmod")"
+        printf "  ${cyan}URL:${reset} %s\n" "$url"
+        printf "\n"
+    done
+}
+
+# Process buckets search response
+process_buckets_response() {
+    local response
+    response=$(cat)
+
+    if [ "$argc_json" = 1 ]; then
+        echo "$response" | jq
+        return
+    fi
+
+    local total_results=$(echo "$response" | jq -r '.meta.results // 0')
+    local keywords=$(echo "$response" | jq -r '.query.keywords // ""')
+
+    printf "${bold}Bucket Search Results${reset}\n"
+    [ -n "$keywords" ] && printf "${cyan}Keywords:${reset} %s\n" "$keywords"
+    printf "${cyan}Total Results:${reset} %s\n" "$total_results"
+    printf "\n"
+
+    # Check if there are buckets
+    if ! echo "$response" | jq -e '.buckets | length > 0' >/dev/null 2>&1; then
+        printf "${yellow}No buckets found${reset}\n"
+        return
+    fi
+
+    # Header
+    printf "%-8s %-50s %-8s %-10s %s\n" "ID" "BUCKET" "TYPE" "FILES" "CONTAINER"
+    printf "%s\n" "$(printf '%.80s' "$(printf '%*s' 80 '' | tr ' ' '-')")"
+
+    # Process each bucket
+    echo "$response" | jq -c '.buckets[]' | while read -r bucket; do
+        local id=$(echo "$bucket" | jq -r '.id')
+        local name=$(echo "$bucket" | jq -r '.bucket')
+        local type=$(echo "$bucket" | jq -r '.type')
+        local filecount=$(echo "$bucket" | jq -r '.fileCount')
+        local container=$(echo "$bucket" | jq -r '.container // ""')
+
+        printf "${yellow}%-8s${reset} %-50s ${cyan}%-8s${reset} ${green}%-10s${reset} %s\n" \
+            "$id" "$name" "$type" "$filecount" "$container"
+    done
+}
+
+# Process bucket details response
+process_bucket_details() {
+    local response
+    response=$(cat)
+
+    if [ "$argc_json" = 1 ]; then
+        echo "$response" | jq
+        return
+    fi
+
+    local bucket_name=$(echo "$response" | jq -r '.bucket // "Unknown"')
+    local type=$(echo "$response" | jq -r '.type // "Unknown"')
+    local filecount=$(echo "$response" | jq -r '.fileCount // 0')
+    local container=$(echo "$response" | jq -r '.container // ""')
+
+    printf "${bold}Bucket Details${reset}\n"
+    printf "${cyan}Name:${reset} %s\n" "$bucket_name"
+    printf "${cyan}Type:${reset} %s\n" "$type"
+    printf "${cyan}File Count:${reset} %s\n" "$filecount"
+    [ -n "$container" ] && printf "${cyan}Container:${reset} %s\n" "$container"
+
+    if echo "$response" | jq -e '.files | length > 0' >/dev/null 2>&1; then
+        printf "\n${bold}Recent Files:${reset}\n"
+        echo "$response" | jq -c '.files[]' | head -10 | while read -r file; do
+            local filename=$(echo "$file" | jq -r '.filename')
+            local size=$(echo "$file" | jq -r '.size')
+            printf "  ${green}%s${reset} (${yellow}%s${reset})\n" "$filename" "$(format_size "$size")"
+        done
+    fi
+}
+
+# @cmd Search for files in exposed buckets
+# @arg keywords! Search keywords (space separated)
+# @option -e --extensions <EXT> File extensions to search for (comma separated)
+# @option -b --buckets <BUCKET> Specific buckets to search (comma separated)
+# @option --exclude-buckets <BUCKET> Buckets to exclude (comma separated)
+# @option -s --start <NUM> Starting offset (default: 0)
+# @option -l --limit <NUM> Number of results to return (default: 10, max: 1000)
+# @option --size-from <BYTES> Minimum file size in bytes
+# @option --size-to <BYTES> Maximum file size in bytes
+# @flag --full-path Search in full file path instead of just filename
+# @flag --regexp Use regular expressions in keywords
+search() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/files"
+    local params="keywords=$(url_encode "$argc_keywords")"
+    local limit="${argc_limit:-10}"
+
+    [ -n "$argc_extensions" ] && params+="&extensions=$(url_encode "$argc_extensions")"
+    [ -n "$argc_buckets" ] && params+="&buckets=$(url_encode "$argc_buckets")"
+    [ -n "$argc_exclude_buckets" ] && params+="&excludedBuckets=$(url_encode "$argc_exclude_buckets")"
+    [ -n "$argc_start" ] && params+="&start=$argc_start"
+    params+="&limit=$limit"
+    [ -n "$argc_size_from" ] && params+="&sizeFrom=$argc_size_from"
+    [ -n "$argc_size_to" ] && params+="&sizeTo=$argc_size_to"
+    [ "$argc_full_path" = 1 ] && params+="&fullPath=true"
+    [ "$argc_regexp" = 1 ] && params+="&regexp=true"
+
+    make_request "$url" "$params" | process_files_response
+}
+
+# @cmd List exposed buckets
+# @arg keywords Search keywords for bucket names
+# @option -s --start <NUM> Starting offset (default: 0)
+# @option -l --limit <NUM> Number of results to return (default: 10, max: 1000)
+# @option -t --type[aws|gcp|azure] Filter by cloud provider type
+buckets() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/buckets"
+    local params="keywords=$(url_encode "${argc_keywords:-}")"
+    local limit="${argc_limit:-10}"
+
+    [ -n "$argc_start" ] && params+="&start=$argc_start"
+    params+="&limit=$limit"
+    [ -n "$argc_type" ] && params+="&type=$argc_type"
+
+    make_request "$url" "$params" | process_buckets_response
+}
+
+# @cmd Get bucket details and file listing
+# @arg bucket_id! Bucket ID to inspect
+bucket() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/buckets/$argc_bucket_id"
+    make_request "$url" "" | process_bucket_details
+}
+
+# @cmd List all files in a specific bucket
+# @arg bucket_name! Bucket name (domain) to list files from
+# @option -s --start <NUM> Starting offset (default: 0)
+# @option -l --limit <NUM> Number of results to return (default: 10, max: 1000)
+files() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/files"
+    local params="buckets=$(url_encode "$argc_bucket_name")"
+    local limit="${argc_limit:-10}"
+
+    [ -n "$argc_start" ] && params+="&start=$argc_start"
+    params+="&limit=$limit"
+
+    make_request "$url" "$params" | process_files_response
+}
+
+eval "$(argc --argc-eval "$0" "$@")"

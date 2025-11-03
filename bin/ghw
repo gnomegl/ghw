@@ -1,0 +1,1002 @@
+#!/usr/bin/env bash
+# GHW - Gray Hat Warfare API Client
+# Version: 1.0.0
+
+# @describe Gray Hat Warfare API client for searching exposed cloud storage
+# @env GRAYHAT_API_KEY! Gray Hat Warfare API key
+# @flag -j --json Output raw JSON instead of formatted results
+# @flag -q --quiet Suppress colored output and progress
+
+# Check dependencies
+check_dependencies() {
+    local missing=()
+    
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        printf "${red}Error:${reset} Missing required dependencies: %s\n" "${missing[*]}" >&2
+        printf "Please install the missing dependencies and try again.\n" >&2
+        exit 1
+    fi
+}
+
+# Setup colors
+setup_colors() {
+    if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+        bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red=""
+    else
+        bold=$(tput bold 2>/dev/null || echo "")
+        reset=$(tput sgr0 2>/dev/null || echo "")
+        blue=$(tput setaf 4 2>/dev/null || echo "")
+        green=$(tput setaf 2 2>/dev/null || echo "")
+        yellow=$(tput setaf 3 2>/dev/null || echo "")
+        cyan=$(tput setaf 6 2>/dev/null || echo "")
+        magenta=$(tput setaf 5 2>/dev/null || echo "")
+        red=$(tput setaf 1 2>/dev/null || echo "")
+    fi
+}
+setup_colors
+check_dependencies
+
+# URL encoding function
+url_encode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * ) printf -v o '%%%02x' "'$c" ;;
+        esac
+        encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+# API request helper
+make_request() {
+    local url="$1"
+    local params="$2"
+
+    if [ -z "$GRAYHAT_API_KEY" ]; then
+        printf "${red}Error:${reset} GRAYHAT_API_KEY environment variable is required\n" >&2
+        exit 1
+    fi
+
+    local full_url="${url}?${params}"
+    local response
+
+    # Show progress unless quiet
+    if [ "$argc_quiet" != 1 ]; then
+        response=$(curl -s --show-error \
+            --header "Authorization: Bearer $GRAYHAT_API_KEY" \
+            "$full_url" 2>&1)
+    else
+        response=$(curl -s \
+            --header "Authorization: Bearer $GRAYHAT_API_KEY" \
+            "$full_url" 2>/dev/null)
+    fi
+
+    if [ $? -ne 0 ]; then
+        printf "${red}Error:${reset} Failed to make API request\n" >&2
+        exit 1
+    fi
+
+    # Check for API errors
+    if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        error_msg=$(echo "$response" | jq -r '.error // "Unknown error"')
+        printf "${red}Error:${reset} %s\n" "$error_msg" >&2
+        exit 1
+    fi
+
+    echo "$response"
+}
+
+# Format file size for human readability
+format_size() {
+    local size="$1"
+    if [ "$size" -eq 0 ]; then
+        echo "0 B"
+    elif [ "$size" -lt 1024 ]; then
+        echo "${size} B"
+    elif [ "$size" -lt 1048576 ]; then
+        echo "$(( size / 1024 )) KB"
+    elif [ "$size" -lt 1073741824 ]; then
+        echo "$(( size / 1048576 )) MB"
+    else
+        echo "$(( size / 1073741824 )) GB"
+    fi
+}
+
+# Format timestamp
+format_date() {
+    local timestamp="$1"
+    if command -v date >/dev/null 2>&1; then
+        date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$timestamp"
+    else
+        echo "$timestamp"
+    fi
+}
+
+# Process files search response
+process_files_response() {
+    local response
+    response=$(cat)
+
+    if [ "$argc_json" = 1 ]; then
+        echo "$response" | jq
+        return
+    fi
+
+    local total_results=$(echo "$response" | jq -r '.meta.results // 0')
+    local keywords=$(echo "$response" | jq -r '.query.keywords // ""')
+
+    printf "${bold}Search Results${reset}\n"
+    printf "${cyan}Keywords:${reset} %s\n" "$keywords"
+    printf "${cyan}Total Results:${reset} %s\n" "$total_results"
+    printf "\n"
+
+    # Check if there are files
+    if ! echo "$response" | jq -e '.files | length > 0' >/dev/null 2>&1; then
+        printf "${yellow}No files found${reset}\n"
+        return
+    fi
+
+    # Process each file
+    echo "$response" | jq -c '.files[]' | while read -r file; do
+        local filename=$(echo "$file" | jq -r '.filename')
+        local bucket=$(echo "$file" | jq -r '.bucket')
+        local size=$(echo "$file" | jq -r '.size')
+        local lastmod=$(echo "$file" | jq -r '.lastModified')
+        local url=$(echo "$file" | jq -r '.url')
+
+        printf "${green}%s${reset}\n" "$filename"
+        printf "  ${cyan}Bucket:${reset} %s\n" "$bucket"
+        printf "  ${cyan}Size:${reset} %s\n" "$(format_size "$size")"
+        printf "  ${cyan}Modified:${reset} %s\n" "$(format_date "$lastmod")"
+        printf "  ${cyan}URL:${reset} %s\n" "$url"
+        printf "\n"
+    done
+}
+
+# Process buckets search response
+process_buckets_response() {
+    local response
+    response=$(cat)
+
+    if [ "$argc_json" = 1 ]; then
+        echo "$response" | jq
+        return
+    fi
+
+    local total_results=$(echo "$response" | jq -r '.meta.results // 0')
+    local keywords=$(echo "$response" | jq -r '.query.keywords // ""')
+
+    printf "${bold}Bucket Search Results${reset}\n"
+    [ -n "$keywords" ] && printf "${cyan}Keywords:${reset} %s\n" "$keywords"
+    printf "${cyan}Total Results:${reset} %s\n" "$total_results"
+    printf "\n"
+
+    # Check if there are buckets
+    if ! echo "$response" | jq -e '.buckets | length > 0' >/dev/null 2>&1; then
+        printf "${yellow}No buckets found${reset}\n"
+        return
+    fi
+
+    # Header
+    printf "%-8s %-50s %-8s %-10s %s\n" "ID" "BUCKET" "TYPE" "FILES" "CONTAINER"
+    printf "%s\n" "$(printf '%.80s' "$(printf '%*s' 80 '' | tr ' ' '-')")"
+
+    # Process each bucket
+    echo "$response" | jq -c '.buckets[]' | while read -r bucket; do
+        local id=$(echo "$bucket" | jq -r '.id')
+        local name=$(echo "$bucket" | jq -r '.bucket')
+        local type=$(echo "$bucket" | jq -r '.type')
+        local filecount=$(echo "$bucket" | jq -r '.fileCount')
+        local container=$(echo "$bucket" | jq -r '.container // ""')
+
+        printf "${yellow}%-8s${reset} %-50s ${cyan}%-8s${reset} ${green}%-10s${reset} %s\n" \
+            "$id" "$name" "$type" "$filecount" "$container"
+    done
+}
+
+# Process bucket details response
+process_bucket_details() {
+    local response
+    response=$(cat)
+
+    if [ "$argc_json" = 1 ]; then
+        echo "$response" | jq
+        return
+    fi
+
+    local bucket_name=$(echo "$response" | jq -r '.bucket // "Unknown"')
+    local type=$(echo "$response" | jq -r '.type // "Unknown"')
+    local filecount=$(echo "$response" | jq -r '.fileCount // 0')
+    local container=$(echo "$response" | jq -r '.container // ""')
+
+    printf "${bold}Bucket Details${reset}\n"
+    printf "${cyan}Name:${reset} %s\n" "$bucket_name"
+    printf "${cyan}Type:${reset} %s\n" "$type"
+    printf "${cyan}File Count:${reset} %s\n" "$filecount"
+    [ -n "$container" ] && printf "${cyan}Container:${reset} %s\n" "$container"
+
+    if echo "$response" | jq -e '.files | length > 0' >/dev/null 2>&1; then
+        printf "\n${bold}Recent Files:${reset}\n"
+        echo "$response" | jq -c '.files[]' | head -10 | while read -r file; do
+            local filename=$(echo "$file" | jq -r '.filename')
+            local size=$(echo "$file" | jq -r '.size')
+            printf "  ${green}%s${reset} (${yellow}%s${reset})\n" "$filename" "$(format_size "$size")"
+        done
+    fi
+}
+
+# @cmd Search for files in exposed buckets
+# @arg keywords! Search keywords (space separated)
+# @option -e --extensions <EXT> File extensions to search for (comma separated)
+# @option -b --buckets <BUCKET> Specific buckets to search (comma separated)
+# @option --exclude-buckets <BUCKET> Buckets to exclude (comma separated)
+# @option -s --start <NUM> Starting offset (default: 0)
+# @option -l --limit <NUM> Number of results to return (default: 10, max: 1000)
+# @option --size-from <BYTES> Minimum file size in bytes
+# @option --size-to <BYTES> Maximum file size in bytes
+# @flag --full-path Search in full file path instead of just filename
+# @flag --regexp Use regular expressions in keywords
+search() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/files"
+    local params="keywords=$(url_encode "$argc_keywords")"
+    local limit="${argc_limit:-10}"
+
+    [ -n "$argc_extensions" ] && params+="&extensions=$(url_encode "$argc_extensions")"
+    [ -n "$argc_buckets" ] && params+="&buckets=$(url_encode "$argc_buckets")"
+    [ -n "$argc_exclude_buckets" ] && params+="&excludedBuckets=$(url_encode "$argc_exclude_buckets")"
+    [ -n "$argc_start" ] && params+="&start=$argc_start"
+    params+="&limit=$limit"
+    [ -n "$argc_size_from" ] && params+="&sizeFrom=$argc_size_from"
+    [ -n "$argc_size_to" ] && params+="&sizeTo=$argc_size_to"
+    [ "$argc_full_path" = 1 ] && params+="&fullPath=true"
+    [ "$argc_regexp" = 1 ] && params+="&regexp=true"
+
+    make_request "$url" "$params" | process_files_response
+}
+
+# @cmd List exposed buckets
+# @arg keywords Search keywords for bucket names
+# @option -s --start <NUM> Starting offset (default: 0)
+# @option -l --limit <NUM> Number of results to return (default: 10, max: 1000)
+# @option -t --type[aws|gcp|azure] Filter by cloud provider type
+buckets() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/buckets"
+    local params="keywords=$(url_encode "${argc_keywords:-}")"
+    local limit="${argc_limit:-10}"
+
+    [ -n "$argc_start" ] && params+="&start=$argc_start"
+    params+="&limit=$limit"
+    [ -n "$argc_type" ] && params+="&type=$argc_type"
+
+    make_request "$url" "$params" | process_buckets_response
+}
+
+# @cmd Get bucket details and file listing
+# @arg bucket_id! Bucket ID to inspect
+bucket() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/buckets/$argc_bucket_id"
+    make_request "$url" "" | process_bucket_details
+}
+
+# @cmd List all files in a specific bucket
+# @arg bucket_name! Bucket name (domain) to list files from
+# @option -s --start <NUM> Starting offset (default: 0)
+# @option -l --limit <NUM> Number of results to return (default: 10, max: 1000)
+files() {
+    local url="https://buckets.grayhatwarfare.com/api/v2/files"
+    local params="buckets=$(url_encode "$argc_bucket_name")"
+    local limit="${argc_limit:-10}"
+
+    [ -n "$argc_start" ] && params+="&start=$argc_start"
+    params+="&limit=$limit"
+
+    make_request "$url" "$params" | process_files_response
+}
+
+# ARGC-BUILD {
+# This block was generated by argc (https://github.com/sigoden/argc).
+# Modifying it manually is not recommended
+
+_argc_run() {
+    if [[ "${1:-}" == "___internal___" ]]; then
+        _argc_die "error: unsupported ___internal___ command"
+    fi
+    if [[ "${OS:-}" == "Windows_NT" ]] && [[ -n "${MSYSTEM:-}" ]]; then
+        set -o igncr
+    fi
+    argc__args=("$(basename "$0" .sh)" "$@")
+    argc__positionals=()
+    _argc_index=1
+    _argc_len="${#argc__args[@]}"
+    _argc_tools=()
+    _argc_parse
+    if [ -n "${argc__fn:-}" ]; then
+        $argc__fn "${argc__positionals[@]}"
+    fi
+}
+
+_argc_usage() {
+    cat <<-'EOF'
+Gray Hat Warfare API client for searching exposed cloud storage
+
+USAGE: ghw [OPTIONS] <COMMAND>
+
+OPTIONS:
+  -j, --json     Output raw JSON instead of formatted results
+  -q, --quiet    Suppress colored output and progress
+  -h, --help     Print help
+  -V, --version  Print version
+
+COMMANDS:
+  search   Search for files in exposed buckets
+  buckets  List exposed buckets
+  bucket   Get bucket details and file listing
+  files    List all files in a specific bucket
+
+ENVIRONMENTS:
+  GRAYHAT_API_KEY*  Gray Hat Warfare API key
+EOF
+    exit
+}
+
+_argc_version() {
+    echo ghw 0.0.0
+    exit
+}
+
+_argc_parse() {
+    local _argc_key _argc_action
+    local _argc_subcmds="search, buckets, bucket, files"
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage
+            ;;
+        --version | -version | -V)
+            _argc_version
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --json | -j)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--json\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_json:-}" ]]; then
+                _argc_die "error: the argument \`--json\` cannot be used multiple times"
+            else
+                argc_json=1
+            fi
+            ;;
+        --quiet | -q)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--quiet\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_quiet:-}" ]]; then
+                _argc_die "error: the argument \`--quiet\` cannot be used multiple times"
+            else
+                argc_quiet=1
+            fi
+            ;;
+        search)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_search
+            break
+            ;;
+        buckets)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_buckets
+            break
+            ;;
+        bucket)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_bucket
+            break
+            ;;
+        files)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_files
+            break
+            ;;
+        help)
+            local help_arg="${argc__args[$((_argc_index + 1))]:-}"
+            case "$help_arg" in
+            search)
+                _argc_usage_search
+                ;;
+            buckets)
+                _argc_usage_buckets
+                ;;
+            bucket)
+                _argc_usage_bucket
+                ;;
+            files)
+                _argc_usage_files
+                ;;
+            "")
+                _argc_usage
+                ;;
+            *)
+                _argc_die "error: invalid value \`$help_arg\` for \`<command>\`"$'\n'"  [possible values: $_argc_subcmds]"
+                ;;
+            esac
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            _argc_die "error: \`ghw\` requires a subcommand but one was not provided"$'\n'"  [subcommands: $_argc_subcmds]"
+            ;;
+        esac
+    done
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        _argc_usage
+    fi
+}
+
+_argc_usage_search() {
+    cat <<-'EOF'
+Search for files in exposed buckets
+
+USAGE: ghw search [OPTIONS] <KEYWORDS>
+
+ARGS:
+  <KEYWORDS>  Search keywords (space separated)
+
+OPTIONS:
+  -e, --extensions <EXT>          File extensions to search for (comma separated)
+  -b, --buckets <BUCKET>          Specific buckets to search (comma separated)
+      --exclude-buckets <BUCKET>  Buckets to exclude (comma separated)
+  -s, --start <NUM>               Starting offset (default: 0)
+  -l, --limit <NUM>               Number of results to return (default: 10, max: 1000)
+      --size-from <BYTES>         Minimum file size in bytes
+      --size-to <BYTES>           Maximum file size in bytes
+      --full-path                 Search in full file path instead of just filename
+      --regexp                    Use regular expressions in keywords
+  -h, --help                      Print help
+
+ENVIRONMENTS:
+  GRAYHAT_API_KEY*  Gray Hat Warfare API key
+EOF
+    exit
+}
+
+_argc_parse_search() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_search
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --extensions | -e)
+            _argc_take_args "--extensions <EXT>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_extensions:-}" ]]; then
+                argc_extensions="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--extensions\` cannot be used multiple times"
+            fi
+            ;;
+        --buckets | -b)
+            _argc_take_args "--buckets <BUCKET>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_buckets:-}" ]]; then
+                argc_buckets="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--buckets\` cannot be used multiple times"
+            fi
+            ;;
+        --exclude-buckets)
+            _argc_take_args "--exclude-buckets <BUCKET>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_exclude_buckets:-}" ]]; then
+                argc_exclude_buckets="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--exclude-buckets\` cannot be used multiple times"
+            fi
+            ;;
+        --start | -s)
+            _argc_take_args "--start <NUM>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_start:-}" ]]; then
+                argc_start="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--start\` cannot be used multiple times"
+            fi
+            ;;
+        --limit | -l)
+            _argc_take_args "--limit <NUM>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_limit:-}" ]]; then
+                argc_limit="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--limit\` cannot be used multiple times"
+            fi
+            ;;
+        --size-from)
+            _argc_take_args "--size-from <BYTES>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_size_from:-}" ]]; then
+                argc_size_from="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--size-from\` cannot be used multiple times"
+            fi
+            ;;
+        --size-to)
+            _argc_take_args "--size-to <BYTES>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_size_to:-}" ]]; then
+                argc_size_to="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--size-to\` cannot be used multiple times"
+            fi
+            ;;
+        --full-path)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--full-path\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_full_path:-}" ]]; then
+                _argc_die "error: the argument \`--full-path\` cannot be used multiple times"
+            else
+                argc_full_path=1
+            fi
+            ;;
+        --regexp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--regexp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_regexp:-}" ]]; then
+                _argc_die "error: the argument \`--regexp\` cannot be used multiple times"
+            else
+                argc_regexp=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=search
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_search
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_keywords="${argc__positionals[values_index]}"
+        else
+            _argc_die "error: the required environments \`<KEYWORDS>\` were not provided"
+        fi
+        _argc_require_params "error: the following required environments were not provided:" \
+            GRAYHAT_API_KEY:GRAYHAT_API_KEY
+    fi
+}
+
+_argc_usage_buckets() {
+    cat <<-'EOF'
+List exposed buckets
+
+USAGE: ghw buckets [OPTIONS] [KEYWORDS]
+
+ARGS:
+  [KEYWORDS]  Search keywords for bucket names
+
+OPTIONS:
+  -s, --start <NUM>  Starting offset (default: 0)
+  -l, --limit <NUM>  Number of results to return (default: 10, max: 1000)
+  -t, --type <TYPE>  Filter by cloud provider type [possible values: aws, gcp, azure]
+  -h, --help         Print help
+
+ENVIRONMENTS:
+  GRAYHAT_API_KEY*  Gray Hat Warfare API key
+EOF
+    exit
+}
+
+_argc_parse_buckets() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_buckets
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --start | -s)
+            _argc_take_args "--start <NUM>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_start:-}" ]]; then
+                argc_start="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--start\` cannot be used multiple times"
+            fi
+            ;;
+        --limit | -l)
+            _argc_take_args "--limit <NUM>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_limit:-}" ]]; then
+                argc_limit="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--limit\` cannot be used multiple times"
+            fi
+            ;;
+        --type | -t)
+            _argc_take_args "--type <TYPE>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            _argc_validate_choices '`<TYPE>`' "$(printf "%s\n" aws gcp azure)" "${_argc_take_args_values[@]}"
+            if [[ -z "${argc_type:-}" ]]; then
+                argc_type="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--type\` cannot be used multiple times"
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=buckets
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_buckets
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_keywords="${argc__positionals[values_index]}"
+        fi
+        _argc_require_params "error: the following required environments were not provided:" \
+            GRAYHAT_API_KEY:GRAYHAT_API_KEY
+    fi
+}
+
+_argc_usage_bucket() {
+    cat <<-'EOF'
+Get bucket details and file listing
+
+USAGE: ghw bucket <BUCKET-ID>
+
+ARGS:
+  <BUCKET-ID>  Bucket ID to inspect
+
+ENVIRONMENTS:
+  GRAYHAT_API_KEY*  Gray Hat Warfare API key
+EOF
+    exit
+}
+
+_argc_parse_bucket() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_bucket
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        *)
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=bucket
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_bucket
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_bucket_id="${argc__positionals[values_index]}"
+        else
+            _argc_die "error: the required environments \`<BUCKET-ID>\` were not provided"
+        fi
+        _argc_require_params "error: the following required environments were not provided:" \
+            GRAYHAT_API_KEY:GRAYHAT_API_KEY
+    fi
+}
+
+_argc_usage_files() {
+    cat <<-'EOF'
+List all files in a specific bucket
+
+USAGE: ghw files [OPTIONS] <BUCKET-NAME>
+
+ARGS:
+  <BUCKET-NAME>  Bucket name (domain) to list files from
+
+OPTIONS:
+  -s, --start <NUM>  Starting offset (default: 0)
+  -l, --limit <NUM>  Number of results to return (default: 10, max: 1000)
+  -h, --help         Print help
+
+ENVIRONMENTS:
+  GRAYHAT_API_KEY*  Gray Hat Warfare API key
+EOF
+    exit
+}
+
+_argc_parse_files() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_files
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --start | -s)
+            _argc_take_args "--start <NUM>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_start:-}" ]]; then
+                argc_start="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--start\` cannot be used multiple times"
+            fi
+            ;;
+        --limit | -l)
+            _argc_take_args "--limit <NUM>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_limit:-}" ]]; then
+                argc_limit="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--limit\` cannot be used multiple times"
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=files
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_files
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_bucket_name="${argc__positionals[values_index]}"
+        else
+            _argc_die "error: the required environments \`<BUCKET-NAME>\` were not provided"
+        fi
+        _argc_require_params "error: the following required environments were not provided:" \
+            GRAYHAT_API_KEY:GRAYHAT_API_KEY
+    fi
+}
+
+_argc_take_args() {
+    _argc_take_args_values=()
+    _argc_take_args_len=0
+    local param="$1" min="$2" max="$3" signs="$4" delimiter="$5"
+    if [[ "$min" -eq 0 ]] && [[ "$max" -eq 0 ]]; then
+        return
+    fi
+    local _argc_take_index=$((_argc_index + 1)) _argc_take_value
+    if [[ "$_argc_item" == *=* ]]; then
+        _argc_take_args_values=("${_argc_item##*=}")
+    else
+        while [[ $_argc_take_index -lt $_argc_len ]]; do
+            _argc_take_value="${argc__args[_argc_take_index]}"
+            if _argc_maybe_flag_option "$signs" "$_argc_take_value"; then
+                if [[ "${#_argc_take_value}" -gt 1 ]]; then
+                    break
+                fi
+            fi
+            _argc_take_args_values+=("$_argc_take_value")
+            _argc_take_args_len=$((_argc_take_args_len + 1))
+            if [[ "$_argc_take_args_len" -ge "$max" ]]; then
+                break
+            fi
+            _argc_take_index=$((_argc_take_index + 1))
+        done
+    fi
+    if [[ "${#_argc_take_args_values[@]}" -lt "$min" ]]; then
+        _argc_die "error: incorrect number of values for \`$param\`"
+    fi
+    if [[ -n "$delimiter" ]] && [[ "${#_argc_take_args_values[@]}" -gt 0 ]]; then
+        local item values arr=()
+        for item in "${_argc_take_args_values[@]}"; do
+            IFS="$delimiter" read -r -a values <<<"$item"
+            arr+=("${values[@]}")
+        done
+        _argc_take_args_values=("${arr[@]}")
+    fi
+}
+
+_argc_match_positionals() {
+    _argc_match_positionals_values=()
+    _argc_match_positionals_len=0
+    local params=("$@")
+    local args_len="${#argc__positionals[@]}"
+    if [[ $args_len -eq 0 ]]; then
+        return
+    fi
+    local params_len=$# arg_index=0 param_index=0
+    while [[ $param_index -lt $params_len && $arg_index -lt $args_len ]]; do
+        local takes=0
+        if [[ "${params[param_index]}" -eq 1 ]]; then
+            if [[ $param_index -eq 0 ]] &&
+                [[ ${_argc_dash:-} -gt 0 ]] &&
+                [[ $params_len -eq 2 ]] &&
+                [[ "${params[$((param_index + 1))]}" -eq 1 ]] \
+                ; then
+                takes=${_argc_dash:-}
+            else
+                local arg_diff=$((args_len - arg_index)) param_diff=$((params_len - param_index))
+                if [[ $arg_diff -gt $param_diff ]]; then
+                    takes=$((arg_diff - param_diff + 1))
+                else
+                    takes=1
+                fi
+            fi
+        else
+            takes=1
+        fi
+        _argc_match_positionals_values+=("$arg_index:$takes")
+        arg_index=$((arg_index + takes))
+        param_index=$((param_index + 1))
+    done
+    if [[ $arg_index -lt $args_len ]]; then
+        _argc_match_positionals_values+=("$arg_index:$((args_len - arg_index))")
+    fi
+    _argc_match_positionals_len=${#_argc_match_positionals_values[@]}
+    if [[ $params_len -gt 0 ]] && [[ $_argc_match_positionals_len -gt $params_len ]]; then
+        local index="${_argc_match_positionals_values[params_len]%%:*}"
+        _argc_die "error: unexpected argument \`${argc__positionals[index]}\` found"
+    fi
+}
+
+_argc_require_params() {
+    local message="$1" missed_envs="" item name render_name
+    for item in "${@:2}"; do
+        name="${item%%:*}"
+        render_name="${item##*:}"
+        if [[ -z "${!name:-}" ]]; then
+            missed_envs="$missed_envs"$'\n'"  $render_name"
+        fi
+    done
+    if [[ -n "${missed_envs}" ]]; then
+        _argc_die "$message$missed_envs"
+    fi
+}
+
+_argc_validate_choices() {
+    local render_name="$1" raw_choices="$2" choices item choice concated_choices=""
+    while IFS= read -r line; do
+        choices+=("$line")
+    done <<<"$raw_choices"
+    for choice in "${choices[@]}"; do
+        if [[ -z "$concated_choices" ]]; then
+            concated_choices="$choice"
+        else
+            concated_choices="$concated_choices, $choice"
+        fi
+    done
+    for item in "${@:3}"; do
+        local pass=0 choice
+        for choice in "${choices[@]}"; do
+            if [[ "$item" == "$choice" ]]; then
+                pass=1
+            fi
+        done
+        if [[ $pass -ne 1 ]]; then
+            _argc_die "error: invalid value \`$item\` for $render_name"$'\n'"  [possible values: $concated_choices]"
+        fi
+    done
+}
+
+_argc_maybe_flag_option() {
+    local signs="$1" arg="$2"
+    if [[ -z "$signs" ]]; then
+        return 1
+    fi
+    local cond=false
+    if [[ "$signs" == *"+"* ]]; then
+        if [[ "$arg" =~ ^\+[^+].* ]]; then
+            cond=true
+        fi
+    elif [[ "$arg" == -* ]]; then
+        if (( ${#arg} < 3 )) || [[ ! "$arg" =~ ^---.* ]]; then
+            cond=true
+        fi
+    fi
+    if [[ "$cond" == "false" ]]; then
+        return 1
+    fi
+    local value="${arg%%=*}"
+    if [[ "$value" =~ [[:space:]] ]]; then
+        return 1
+    fi
+    return 0
+}
+
+_argc_die() {
+    if [[ $# -eq 0 ]]; then
+        cat
+    else
+        echo "$*" >&2
+    fi
+    exit 1
+}
+
+_argc_run "$@"
+
+# ARGC-BUILD }
